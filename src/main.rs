@@ -6,8 +6,10 @@ use std::env;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use zip::ZipArchive;
@@ -196,7 +198,7 @@ impl PackageInfo {
     }
 
     pub fn kill_miner(&self, child: &mut Child) -> Result<()> {
-        child.kill()?;
+        child.start_kill()?;
         Ok(())
     }
 
@@ -222,7 +224,8 @@ impl PackageInfo {
                     let mut child_lock = child.lock().await;
                     pi.kill_miner(&mut child_lock).unwrap();
                     pi.ensure_latest_version().await.unwrap();
-                    *child_lock = pi.run_miner().unwrap();
+                    let new_child = pi.run_miner().unwrap();
+                    *child_lock = new_child;
                 }
             }
         });
@@ -239,15 +242,39 @@ async fn main() -> Result<()> {
         pi.ensure_latest_version().await?;
     }
 
-    let child = {
+    let mut child = {
         let pi = package_info.lock().await;
         pi.run_miner()?
     };
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout was not configured to a pipe");
+
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr was not configured to a pipe");
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            println!("{}", line);
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            eprintln!("{}", line);
+        }
+    });
+
     let child = Arc::new(Mutex::new(child));
 
     PackageInfo::start_update_watcher(package_info.clone(), child.clone());
 
-    let child_for_wait = child.clone();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             println!("Ctrl-C received, shutting down miner...");
@@ -256,10 +283,11 @@ async fn main() -> Result<()> {
             pi.kill_miner(&mut child_lock)?;
             println!("Miner shut down.");
         }
-        status = tokio::task::spawn_blocking(move || {
-            child_for_wait.blocking_lock().wait()
-        }) => {
-            println!("Miner exited with status: {:?}", status);
+        res = async {
+            let mut child_guard = child.lock().await;
+            child_guard.wait().await
+        } => {
+            println!("Miner exited with status: {:?}", res);
         }
     }
 
