@@ -15,6 +15,8 @@ use tokio::time::{interval, Duration};
 use zip::ZipArchive;
 
 const UPDATE_URL: &str = "https://api.github.com/repos/SWPSCO/nockpool-miner/releases/latest";
+// const UPDATE_INTERVAL: u64 = 15 * 60;
+const UPDATE_INTERVAL: u64 = 15;
 
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
@@ -188,9 +190,10 @@ impl PackageInfo {
         Ok(())
     }
 
-    pub fn run_miner(&self) -> Result<Child> {
+    pub fn run_miner(&self, args: &[String]) -> Result<Child> {
         let bin_path = self.current_symlink.join(&self.bin_name);
         let child = Command::new(bin_path)
+            .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -205,9 +208,10 @@ impl PackageInfo {
     pub fn start_update_watcher(
         package_info: Arc<Mutex<PackageInfo>>,
         child: Arc<Mutex<Child>>,
+        miner_args: Vec<String>,
     ) {
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(15 * 60));
+            let mut interval = interval(Duration::from_secs(UPDATE_INTERVAL));
             loop {
                 interval.tick().await;
                 let mut pi = package_info.lock().await;
@@ -224,8 +228,10 @@ impl PackageInfo {
                     let mut child_lock = child.lock().await;
                     pi.kill_miner(&mut child_lock).unwrap();
                     pi.ensure_latest_version().await.unwrap();
-                    let new_child = pi.run_miner().unwrap();
+                    let new_child = pi.run_miner(&miner_args).unwrap();
                     *child_lock = new_child;
+                } else {
+                    println!("Already on the latest version.");
                 }
             }
         });
@@ -234,17 +240,36 @@ impl PackageInfo {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut disable_update_loop = false;
+    let mut no_update = false;
+    let mut miner_args = Vec::new();
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--disable-update-loop" => disable_update_loop = true,
+            "--no-update" => no_update = true,
+            _ => miner_args.push(arg),
+        }
+    }
+
     let package_info = PackageInfo::new()?;
     let package_info = Arc::new(Mutex::new(package_info));
 
-    {
+    if no_update {
+        let pi = package_info.lock().await;
+        if pi.get_local_version().is_none() {
+            return Err(anyhow::anyhow!(
+                "No current version installed. Please run without --no-update first."
+            ));
+        }
+    } else {
         let mut pi = package_info.lock().await;
         pi.ensure_latest_version().await?;
     }
 
     let mut child = {
         let pi = package_info.lock().await;
-        pi.run_miner()?
+        pi.run_miner(&miner_args)?
     };
 
     let stdout = child
@@ -273,7 +298,9 @@ async fn main() -> Result<()> {
 
     let child = Arc::new(Mutex::new(child));
 
-    PackageInfo::start_update_watcher(package_info.clone(), child.clone());
+    if !disable_update_loop {
+        PackageInfo::start_update_watcher(package_info.clone(), child.clone(), miner_args);
+    }
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
