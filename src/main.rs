@@ -16,9 +16,11 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use zip::ZipArchive;
 use tracing::info;
+use directories::ProjectDirs;
 
 const UPDATE_URL: &str = "https://api.github.com/repos/SWPSCO/nockpool-miner/releases/latest";
-const UPDATE_INTERVAL: u64 = 15 * 60;
+// const UPDATE_INTERVAL: u64 = 15 * 60;
+const UPDATE_INTERVAL: u64 = 30;
 
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
@@ -49,12 +51,12 @@ impl PackageInfo {
         let (os_name, arch) = Self::get_device_info()?;
         let bin_name = "nockpool-miner".to_string();
 
-        let base_dir = if os_name == "macos" {
-            env::var("HOME").unwrap() + "/Library/Application Support/nockpool-miner"
+        let base_dir = if let Some(proj_dirs) = ProjectDirs::from("com", "swps", "nockpool-miner") {
+            proj_dirs.data_dir().to_path_buf()
         } else {
-            "/opt/nockpool-miner".to_string()
+            return Err(anyhow::anyhow!("Could not determine application data directory"));
         };
-        let base_dir = PathBuf::from(base_dir);
+
         let versions_dir = base_dir.join("versions");
         let current_symlink = base_dir.join("current");
 
