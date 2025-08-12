@@ -1,0 +1,154 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions: write-all
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-linux-x64:
+    runs-on: ['self-hosted', 'Linux', 'X64']
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          targets: x86_64-unknown-linux-gnu
+      - name: build
+        run: cargo build --release --target x86_64-unknown-linux-gnu --bin miner-launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts-x64
+          path: target/x86_64-unknown-linux-gnu/release/miner-launcher
+
+  build-macos:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with: { toolchain: stable, profile: minimal }
+      - name: build
+        run: cargo build --release --bin miner-launcher
+      - name: import certs
+        env:
+          APPLE_P12: ${{ secrets.APPLE_P12 }}
+          APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+          APPLE_INSTALLER_P12: ${{ secrets.APPLE_INSTALLER_P12 }} 
+          APPLE_INSTALLER_P12_PASSWORD: ${{ secrets.APPLE_INSTALLER_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_P12" | base64 --decode > cert.p12
+          
+          KEYCHAIN_NAME="build-${{ github.run_id }}.keychain"
+          
+          security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
+          
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | sed s/\"//g)
+          security set-keychain-settings -t 3600 -l "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          
+          security import cert.p12 -k "$KEYCHAIN_NAME" -P "$APPLE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,security: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          
+          security default-keychain -s "$KEYCHAIN_NAME"
+          
+          security find-identity -v -p codesigning "$KEYCHAIN_NAME"
+          
+          rm cert.p12
+          
+          echo "$APPLE_INSTALLER_P12" | base64 --decode > installer.p12
+          security import installer.p12 -k "$KEYCHAIN_NAME" \
+            -P "$APPLE_INSTALLER_P12_PASSWORD" \
+            -T /usr/bin/productsign -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign:,security: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          rm installer.p12
+          
+          echo "KEYCHAIN_NAME=$KEYCHAIN_NAME" >> $GITHUB_ENV
+      - name: codesign bins
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          
+          codesign --force --options runtime --timestamp \
+            --sign "Developer ID Application: Southwestern Pool Supply CO INC (484J85QW9N)" \
+            --keychain "$KEYCHAIN_NAME" \
+            target/release/miner-launcher
+      - name: build & notarize installer pkgs
+        env:
+          AC_API_KEY_ID:     ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID:  ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_PATH:   ${{ secrets.AC_API_KEY_PATH }}
+          TEAM_ID:           484J85QW9N
+        run: |
+          echo "$AC_API_KEY_PATH" | base64 --decode > key.p8
+          mkdir -p dist pkgroot/usr/local/bin
+          cp target/release/miner-launcher pkgroot/usr/local/bin/
+          pkgbuild --root pkgroot \
+                   --identifier io.swps.miner-launcher.pkg \
+                   --version 1.0.0 \
+                   --install-location / \
+                   miner-launcher-unsigned.pkg
+          productsign --sign "Developer ID Installer: Southwestern Pool Supply CO INC (484J85QW9N)" \
+                      miner-launcher-unsigned.pkg "dist/miner-launcher.pkg"
+          xcrun notarytool submit "dist/miner-launcher.pkg" \
+               --key key.p8 --key-id "$AC_API_KEY_ID" \
+               --issuer "$AC_API_ISSUER_ID" --team-id "$TEAM_ID" --wait
+          xcrun stapler staple "dist/miner-launcher.pkg"
+          rm -rf key.p8 pkgroot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-installer
+          path: dist/*.pkg
+
+  package:
+    needs: [build-linux-x64, build-macos]
+    runs-on: ['self-hosted', 'Linux', 'X64']
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-artifacts-x64
+          path: ./linux_x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-installer
+          path: ./mac
+      - name: make zips
+        run: |
+          mkdir -p out
+          cp linux_x64/miner-launcher out/miner-launcher_linux_x64
+          chmod +x out/miner-launcher_linux_x64
+          tar -czf out/miner-launcher_linux_x64.tar.gz -C out miner-launcher_linux_x64
+          cp mac/miner-launcher.pkg out/miner-launcher_macos_aarch64.pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packaged-artifacts
+          path: |
+            out/miner-launcher_linux_x64.tar.gz
+            out/miner-launcher_macos_aarch64.pkg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ['self-hosted', 'Linux', 'X64']
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packaged-artifacts
+          path: ./out
+      - uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            out/miner-launcher_linux_x64.tar.gz
+            out/miner-launcher_macos_aarch64.pkg
