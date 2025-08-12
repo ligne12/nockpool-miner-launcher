@@ -18,8 +18,7 @@ use zip::ZipArchive;
 use tracing::info;
 
 const UPDATE_URL: &str = "https://api.github.com/repos/SWPSCO/nockpool-miner/releases/latest";
-// const UPDATE_INTERVAL: u64 = 15 * 60;
-const UPDATE_INTERVAL: u64 = 15;
+const UPDATE_INTERVAL: u64 = 15 * 60;
 
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
@@ -292,14 +291,14 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            info!("{}", line);
+            eprintln!("{}", line);
         }
     });
 
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            info!("{}", line);
+            eprintln!("{}", line);
         }
     });
 
