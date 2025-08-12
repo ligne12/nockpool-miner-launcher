@@ -1,3 +1,5 @@
+mod tracer;
+
 use anyhow::Result;
 use reqwest::{header::USER_AGENT, Client};
 use serde::Deserialize;
@@ -13,6 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use zip::ZipArchive;
+use tracing::info;
 
 const UPDATE_URL: &str = "https://api.github.com/repos/SWPSCO/nockpool-miner/releases/latest";
 // const UPDATE_INTERVAL: u64 = 15 * 60;
@@ -142,11 +145,11 @@ impl PackageInfo {
         };
 
         if needs_update {
-            println!("New version {} is available. Downloading...", self.version);
+            info!("New version {} is available. Downloading...", self.version);
             self.download_and_run().await?;
             self.update_symlink()?;
         } else {
-            println!("You are on the latest version.");
+            info!("You are on the latest version.");
         }
         Ok(())
     }
@@ -223,15 +226,17 @@ impl PackageInfo {
                     None => true,
                 };
 
+                info!("Checking for updates...");
+
                 if needs_update {
-                    println!("Update found in background, restarting miner...");
+                    info!("Update found in background, restarting miner...");
                     let mut child_lock = child.lock().await;
                     pi.kill_miner(&mut child_lock).unwrap();
                     pi.ensure_latest_version().await.unwrap();
                     let new_child = pi.run_miner(&miner_args).unwrap();
                     *child_lock = new_child;
                 } else {
-                    println!("Already on the latest version.");
+                    info!("Already on the latest version.");
                 }
             }
         });
@@ -240,6 +245,8 @@ impl PackageInfo {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracer::init();
+
     let mut disable_update_loop = false;
     let mut no_update = false;
     let mut miner_args = Vec::new();
@@ -285,14 +292,14 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            println!("{}", line);
+            info!("{}", line);
         }
     });
 
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("{}", line);
+            info!("{}", line);
         }
     });
 
@@ -304,17 +311,17 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("Ctrl-C received, shutting down miner...");
+            info!("Ctrl-C received, shutting down miner...");
             let mut child_lock = child.lock().await;
             let pi = package_info.lock().await;
             pi.kill_miner(&mut child_lock)?;
-            println!("Miner shut down.");
+            info!("Miner shut down.");
         }
         res = async {
             let mut child_guard = child.lock().await;
             child_guard.wait().await
         } => {
-            println!("Miner exited with status: {:?}", res);
+            info!("Miner exited with status: {:?}", res);
         }
     }
 
