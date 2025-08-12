@@ -18,7 +18,7 @@ use zip::ZipArchive;
 use tracing::info;
 use directories::ProjectDirs;
 
-const UPDATE_URL: &str = "https://api.github.com/repos/SWPSCO/nockpool-miner/releases/latest";
+const UPDATE_URL: &str = "https://nockpool.com/api/version";
 const UPDATE_INTERVAL: u64 = 15 * 60;
 
 #[derive(Debug, Deserialize)]
