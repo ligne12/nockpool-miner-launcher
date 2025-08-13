@@ -137,7 +137,6 @@ jobs:
             out/miner-launcher_macos_aarch64.pkg
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: package
     runs-on: ['self-hosted', 'Linux', 'X64']
     steps:
