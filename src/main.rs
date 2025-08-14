@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, Duration};
 use zip::ZipArchive;
 use tracing::info;
@@ -146,7 +146,7 @@ impl PackageInfo {
 
         if needs_update {
             info!("New version {} is available. Downloading...", self.version);
-            self.download_and_run().await?;
+            self.download_and_install().await?;
             self.update_symlink()?;
         } else {
             info!("You are on the latest version.");
@@ -154,7 +154,7 @@ impl PackageInfo {
         Ok(())
     }
 
-    async fn download_and_run(&self) -> Result<()> {
+    async fn download_and_install(&self) -> Result<()> {
         let response = reqwest::get(&self.download_url).await?;
         let bytes = response.bytes().await?;
 
@@ -210,31 +210,38 @@ impl PackageInfo {
 
     pub fn start_update_watcher(
         package_info: Arc<Mutex<PackageInfo>>,
-        child: Arc<Mutex<Child>>,
-        miner_args: Vec<String>,
+        update_notifier: Arc<Notify>,
     ) {
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(UPDATE_INTERVAL));
             loop {
                 interval.tick().await;
+                info!("Checking for updates...");
+
                 let mut pi = package_info.lock().await;
                 let local_version = pi.get_local_version();
-                pi.fetch_latest().await.unwrap();
+
+                if let Err(e) = pi.fetch_latest().await {
+                    info!("Failed to check for updates: {}", e);
+                    continue;
+                }
 
                 let needs_update = match local_version {
                     Some(lv) => lv != pi.version,
                     None => true,
                 };
 
-                info!("Checking for updates...");
-
                 if needs_update {
-                    info!("Update found in background, restarting miner...");
-                    let mut child_lock = child.lock().await;
-                    pi.kill_miner(&mut child_lock).unwrap();
-                    pi.ensure_latest_version().await.unwrap();
-                    let new_child = pi.run_miner(&miner_args).unwrap();
-                    *child_lock = new_child;
+                    info!("Update found in background, preparing update...");
+                    if let Err(e) = pi.download_and_install().await {
+                        info!("Failed to download update: {}", e);
+                        continue;
+                    }
+                    if let Err(e) = pi.update_symlink() {
+                        info!("Failed to update symlink: {}", e);
+                        continue;
+                    }
+                    update_notifier.notify_one();
                 } else {
                     info!("Already on the latest version.");
                 }
@@ -274,54 +281,87 @@ async fn main() -> Result<()> {
         pi.ensure_latest_version().await?;
     }
 
-    let mut child = {
-        let pi = package_info.lock().await;
-        pi.run_miner(&miner_args)?
-    };
-
-    let stdout = child
-        .stdout
-        .take()
-        .expect("child stdout was not configured to a pipe");
-
-    let stderr = child
-        .stderr
-        .take()
-        .expect("child stderr was not configured to a pipe");
-
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("{}", line);
-        }
-    });
-
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("{}", line);
-        }
-    });
-
-    let child = Arc::new(Mutex::new(child));
+    let restart_notifier = Arc::new(Notify::new());
+    let update_notifier = Arc::new(Notify::new());
 
     if !disable_update_loop {
-        PackageInfo::start_update_watcher(package_info.clone(), child.clone(), miner_args);
+        PackageInfo::start_update_watcher(package_info.clone(), update_notifier.clone());
     }
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl-C received, shutting down miner...");
-            let mut child_lock = child.lock().await;
+    loop {
+        let mut child = {
             let pi = package_info.lock().await;
-            pi.kill_miner(&mut child_lock)?;
-            info!("Miner shut down.");
-        }
-        res = async {
-            let mut child_guard = child.lock().await;
-            child_guard.wait().await
-        } => {
-            info!("Miner exited with status: {:?}", res);
+            pi.run_miner(&miner_args)?
+        };
+
+        let stdout = child
+            .stdout
+            .take()
+            .expect("child stdout was not configured to a pipe");
+
+        let stderr = child
+            .stderr
+            .take()
+            .expect("child stderr was not configured to a pipe");
+
+        let restart_notifier_stdout = restart_notifier.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if line.contains("restart-miner-now") {
+                    info!("Restart signal received from stdout, restarting miner...");
+                    restart_notifier_stdout.notify_one();
+                    break;
+                }
+                eprintln!("{}", line);
+            }
+        });
+
+        let restart_notifier_stderr = restart_notifier.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if line.contains("restart-miner-now") {
+                    info!("Restart signal received from stderr, restarting miner...");
+                    restart_notifier_stderr.notify_one();
+                    break;
+                }
+                eprintln!("{}", line);
+            }
+        });
+
+        let child = Arc::new(Mutex::new(child));
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received, shutting down miner...");
+                let mut child_lock = child.lock().await;
+                let pi = package_info.lock().await;
+                pi.kill_miner(&mut child_lock)?;
+                info!("Miner shut down.");
+                break;
+            }
+            _ = restart_notifier.notified() => {
+                info!("Restarting miner due to output signal...");
+                let mut child_lock = child.lock().await;
+                let pi = package_info.lock().await;
+                let _ = pi.kill_miner(&mut child_lock);
+                continue;
+            }
+            _ = update_notifier.notified() => {
+                info!("Restarting miner due to update...");
+                let mut child_lock = child.lock().await;
+                let pi = package_info.lock().await;
+                let _ = pi.kill_miner(&mut child_lock);
+                continue;
+            }
+            res = async {
+                let mut child_guard = child.lock().await;
+                child_guard.wait().await
+            } => {
+                info!("Miner exited with status: {:?}. Restarting...", res);
+                continue;
+            }
         }
     }
 
