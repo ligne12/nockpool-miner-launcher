@@ -21,7 +21,7 @@ use directories::ProjectDirs;
 #[cfg(target_arch = "x86_64")]
 use std::arch::is_x86_feature_detected;
 
-const UPDATE_URL: &str = "http://localhost:5173/api/version"; // For testing - change back to https://nockpool.com/api/version for production
+const UPDATE_URL: &str = "https://nockpool.com/api/version";
 const UPDATE_INTERVAL: u64 = 15 * 60;
 
 #[derive(Debug, Serialize)]
