@@ -113,6 +113,8 @@ struct ReleaseInfo {
     tag_name: String,
     assets: Vec<Asset>,
     selected_binary: Option<String>,
+    selected_so_file: Option<String>,
+    selected_jam_file: Option<String>,
     system_analysis: Option<serde_json::Value>,
 }
 
@@ -128,8 +130,12 @@ struct PackageInfo {
     arch: String,
     version: String,
     download_url: String,
+    so_download_url: Option<String>,
+    jam_download_url: Option<String>,
     bin_name: String,
     package_name: String,
+    so_file_name: Option<String>,
+    jam_file_name: Option<String>,
     versions_dir: PathBuf,
     current_symlink: PathBuf,
 }
@@ -153,8 +159,12 @@ impl PackageInfo {
             arch,
             version: String::new(),
             download_url: String::new(),
+            so_download_url: None,
+            jam_download_url: None,
             bin_name,
             package_name: String::new(),
+            so_file_name: None,
+            jam_file_name: None,
             versions_dir,
             current_symlink,
         })
@@ -607,10 +617,10 @@ impl PackageInfo {
 
     pub async fn fetch_latest(&mut self) -> Result<()> {
         let client = Client::new();
-        
+
         // First try the enhanced endpoint with system information
         let system_info = Self::collect_system_info()?;
-        
+
         // Sending system information to endpoint for binary selection
         let enhanced_response = client
             .post(UPDATE_URL)
@@ -639,22 +649,49 @@ impl PackageInfo {
 
         // Use selected_binary if provided, otherwise system not supported
         if let Some(_selected_binary) = &release_info.selected_binary {
-            
+
             // Extract version from tag_name
             self.version = release_info.tag_name
                 .split('-')
                 .next()
                 .unwrap_or(&release_info.tag_name)
                 .replace("v", "");
-            
-            // Find the appropriate asset
+
+            // Check for .so file URL directly from response
+            if let Some(ref selected_so_url) = release_info.selected_so_file {
+                self.so_download_url = Some(selected_so_url.clone());
+                // Extract filename from URL
+                if let Some(filename) = selected_so_url.split('/').last() {
+                    self.so_file_name = Some(filename.to_string());
+                }
+            }
+
+            // Check for .jam file URL directly from response
+            if let Some(ref selected_jam_url) = release_info.selected_jam_file {
+                self.jam_download_url = Some(selected_jam_url.clone());
+                // Extract filename from URL
+                if let Some(filename) = selected_jam_url.split('/').last() {
+                    self.jam_file_name = Some(filename.to_string());
+                }
+            }
+
+            // Find the appropriate binary asset
+            let mut found_binary = false;
+
             for asset in &release_info.assets {
-                // Check if this asset matches our system (simplified matching)
+                // Check if this asset matches our binary
                 if self.is_compatible_asset(&asset.name, _selected_binary) {
                     self.download_url = asset.browser_download_url.clone();
                     self.package_name = asset.name.clone();
-                    return Ok(());
+                    found_binary = true;
+                    break;
                 }
+            }
+
+            if found_binary {
+                return Ok(());
+            } else {
+                return Err(anyhow::anyhow!("No compatible binary asset found in release"));
             }
         }
 
@@ -666,12 +703,38 @@ impl PackageInfo {
     fn is_compatible_asset(&self, asset_name: &str, _selected_binary: &str) -> bool {
         // Simple compatibility check - in a real implementation, this would be more sophisticated
         let asset_lower = asset_name.to_lowercase();
-        
+
         // Check for basic OS and architecture compatibility
         let os_match = asset_lower.contains(&self.os_name);
         let arch_match = asset_lower.contains(&self.arch);
-        
+
         os_match && arch_match
+    }
+
+    fn is_compatible_so_asset(&self, asset_name: &str, _selected_so: &str) -> bool {
+        let asset_lower = asset_name.to_lowercase();
+
+        // Check if it's a .so file and matches our system
+        if asset_lower.ends_with(".so") {
+            let os_match = asset_lower.contains(&self.os_name);
+            let arch_match = asset_lower.contains(&self.arch);
+            return os_match && arch_match;
+        }
+
+        false
+    }
+
+    fn is_compatible_jam_asset(&self, asset_name: &str, _selected_jam: &str) -> bool {
+        let asset_lower = asset_name.to_lowercase();
+
+        // Check if it's a .jam file and matches our system
+        if asset_lower.ends_with(".jam") {
+            let os_match = asset_lower.contains(&self.os_name);
+            let arch_match = asset_lower.contains(&self.arch);
+            return os_match && arch_match;
+        }
+
+        false
     }
 
     pub fn get_local_version(&self) -> Option<String> {
@@ -684,32 +747,70 @@ impl PackageInfo {
         }
     }
 
+    fn check_addon_files_exist(&self) -> (bool, bool) {
+        if let Some(version) = &self.get_local_version() {
+            let version_dir = self.versions_dir.join(version);
+
+            let so_exists = if let Some(so_name) = &self.so_file_name {
+                version_dir.join(so_name).exists()
+            } else {
+                true // No .so file expected, so consider it "exists"
+            };
+
+            let jam_exists = if let Some(jam_name) = &self.jam_file_name {
+                version_dir.join(jam_name).exists()
+            } else {
+                true // No .jam file expected, so consider it "exists"
+            };
+
+            (so_exists, jam_exists)
+        } else {
+            (false, false) // No version installed, so files don't exist
+        }
+    }
+
     pub async fn ensure_latest_version(&mut self) -> Result<()> {
         let local_version = self.get_local_version();
         self.fetch_latest().await?;
 
-        let needs_update = match local_version {
+        let version_mismatch = match local_version {
             Some(lv) => lv != self.version,
             None => true,
         };
 
+        let (so_exists, jam_exists) = self.check_addon_files_exist();
+        let missing_addon_files = !so_exists || !jam_exists;
+
+        let needs_update = version_mismatch || missing_addon_files;
+
         if needs_update {
-            info!("New version {} is available. Downloading...", self.version);
+            if version_mismatch {
+                info!("New version {} is available. Downloading...", self.version);
+            } else if missing_addon_files {
+                info!("Missing addon files detected. Downloading...");
+                if !so_exists && self.so_file_name.is_some() {
+                    info!("Missing .so file");
+                }
+                if !jam_exists && self.jam_file_name.is_some() {
+                    info!("Missing .jam file");
+                }
+            }
+
             self.download_and_install().await?;
             self.update_symlink()?;
         } else {
-            info!("You are on the latest version.");
+            info!("You are on the latest version with all required files.");
         }
         Ok(())
     }
 
     async fn download_and_install(&self) -> Result<()> {
-        let response = reqwest::get(&self.download_url).await?;
-        let bytes = response.bytes().await?;
-
         let version_dir = self.versions_dir.join(&self.version);
         fs::create_dir_all(&version_dir)?;
 
+        // Download main binary
+        let response = reqwest::get(&self.download_url).await?;
+        let bytes = response.bytes().await?;
         let bin_path = version_dir.join(&self.bin_name);
 
         if self.os_name == "macos" {
@@ -724,6 +825,38 @@ impl PackageInfo {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755))?;
+        }
+
+        // Download .so file if available
+        if let (Some(so_url), Some(so_name)) = (&self.so_download_url, &self.so_file_name) {
+            let so_response = reqwest::get(so_url).await?;
+            let so_bytes = so_response.bytes().await?;
+            let so_path = version_dir.join(so_name);
+
+            let mut so_file = fs::File::create(&so_path)?;
+            so_file.write_all(&so_bytes)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&so_path, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+
+        // Download .jam file if available
+        if let (Some(jam_url), Some(jam_name)) = (&self.jam_download_url, &self.jam_file_name) {
+            let jam_response = reqwest::get(jam_url).await?;
+            let jam_bytes = jam_response.bytes().await?;
+            let jam_path = version_dir.join(jam_name);
+
+            let mut jam_file = fs::File::create(&jam_path)?;
+            jam_file.write_all(&jam_bytes)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&jam_path, fs::Permissions::from_mode(0o644))?;
+            }
         }
 
         Ok(())
@@ -775,13 +908,22 @@ impl PackageInfo {
                     continue;
                 }
 
-                let needs_update = match local_version {
+                let version_mismatch = match local_version {
                     Some(lv) => lv != pi.version,
                     None => true,
                 };
 
+                let (so_exists, jam_exists) = pi.check_addon_files_exist();
+                let missing_addon_files = !so_exists || !jam_exists;
+
+                let needs_update = version_mismatch || missing_addon_files;
+
                 if needs_update {
-                    info!("Update found in background, preparing update...");
+                    if version_mismatch {
+                        info!("Update found in background, preparing update...");
+                    } else if missing_addon_files {
+                        info!("Missing addon files detected in background, downloading...");
+                    }
                     if let Err(e) = pi.download_and_install().await {
                         info!("Failed to download update: {}", e);
                         continue;
