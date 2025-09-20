@@ -19,9 +19,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
+      - name: Log in to Dockerhub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Build Linux binary in container
         run: |
-          cat > Dockerfile.build << 'EOF'
+          cat > Dockerfile << 'EOF'
           FROM ubuntu:22.04
           RUN apt-get update && apt-get install -y \
               curl \
@@ -40,12 +46,47 @@ jobs:
           RUN cargo build --target x86_64-unknown-linux-gnu --release
           EOF
           
-          docker build -f Dockerfile.build -t launcher-builder:latest .
+          docker build --no-cache -f Dockerfile -t launcher-builder:latest -t swpsco/miner-launcher:latest .
           docker create --name extract launcher-builder:latest
           docker cp extract:/build/target/x86_64-unknown-linux-gnu/release/miner-launcher ./miner-launcher
           docker rm extract
           chmod +x miner-launcher
-      - uses: actions/upload-artifact@v4
+
+      - name: Build Linux with newer glibc
+        run: |
+          cat > Dockerfile << 'EOF'
+          FROM ubuntu:25.10
+          RUN apt-get update && apt-get install -y \
+              curl \
+              gcc \
+              g++ \
+              make \
+              libc6-dev \
+              git \
+              && rm -rf /var/lib/apt/lists/*
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+          ENV PATH="/root/.cargo/bin:${PATH}"
+          RUN rustup target add x86_64-unknown-linux-gnu
+          WORKDIR /build
+          COPY . .
+          ENV RUSTFLAGS="-A warnings"
+          RUN cargo build --target x86_64-unknown-linux-gnu --release
+          RUN mv target/x86_64-unknown-linux-gnu/release/miner-launcher /usr/local/
+          EOF
+          
+          docker build --no-cache -f Dockerfile -t swpsco/miner-launcher:latest .
+
+      - name: Build and push
+        id: pusher
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: swpsco/miner-launcher:latest
+          no-cache: false
+
+      - name: upload bin
+        uses: actions/upload-artifact@v4
         with:
           name: linux-artifacts-x64
           path: miner-launcher
