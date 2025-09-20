@@ -71,7 +71,8 @@ jobs:
           COPY . .
           ENV RUSTFLAGS="-A warnings"
           RUN cargo build --target x86_64-unknown-linux-gnu --release
-          RUN mv target/x86_64-unknown-linux-gnu/release/miner-launcher /usr/local/
+          RUN mv target/x86_64-unknown-linux-gnu/release/miner-launcher /usr/local/bin/
+          ENTRYPOINT ["miner-launcher", "--help"]
           EOF
           
           docker build --no-cache -f Dockerfile -t swpsco/miner-launcher:latest .
